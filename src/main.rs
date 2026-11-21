@@ -28,6 +28,7 @@ mod motion;
 mod opus;
 mod preset;
 mod shader;
+mod sources;
 mod sponsorblock;
 mod stream;
 mod theme;

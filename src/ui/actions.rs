@@ -230,8 +230,8 @@ impl App {
                 if let Some(listed) = listed.filter(|l| l != &id) {
                     self.backend.upgrade_quality(&listed);
                 }
-                if self.hires_sources.is_empty() {
-                    self.toast("No hi-res source is set. Add one in Settings › Playback first.");
+                if self.hires_sources.is_empty() && !self.jiosaavn {
+                    self.toast("No source is set. Add a hi-res source or switch JioSaavn on in Settings › Playback first.");
                 } else if self.audio_info.is_none() && self.audio.status.wanted_gen.load(std::sync::atomic::Ordering::Relaxed) == self.generation {
                     // Ask for the stream that is playing, in place. The backend reports the
                     // attempt either way, so nothing here claims success on its own.

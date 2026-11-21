@@ -102,6 +102,11 @@ impl Info {
         }
     }
 
+    /// The badge already says this rate ("320 kbps"), so the line needn't repeat it.
+    fn badge_names_rate(&self, kbps: u32) -> bool {
+        self.badge() == format!("{kbps} kbps")
+    }
+
     /// The one-line audio-quality string the player's track-info and Discord both show:
     /// the badge, then each format detail that is known, joined with " · ".
     /// "Hi-Res Lossless · FLAC · 1641 kbps · 24-bit · 44.1 kHz · Stereo".
@@ -111,7 +116,9 @@ impl Info {
         if !codec.is_empty() {
             parts.push(codec.to_ascii_uppercase());
         }
-        if let Some(k) = self.bitrate_kbps.filter(|k| *k > 0) {
+        if let Some(k) = self.bitrate_kbps.filter(|k| *k > 0)
+            && !self.badge_names_rate(k)
+        {
             parts.push(format!("{k} kbps"));
         }
         if let Some(bits) = self.bit_depth {
@@ -137,7 +144,9 @@ impl Info {
         if !codec.is_empty() {
             parts.push(codec.to_ascii_uppercase());
         }
-        if let Some(k) = self.bitrate_kbps.filter(|k| *k > 0) {
+        if let Some(k) = self.bitrate_kbps.filter(|k| *k > 0)
+            && !self.badge_names_rate(k)
+        {
             parts.push(format!("{k} kbps"));
         }
         if let Some(bits) = self.bit_depth {
@@ -576,7 +585,7 @@ pub fn normalize_base(raw: &str) -> String {
     }
 }
 
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     url::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default()
 }
 
@@ -705,7 +714,7 @@ fn playable_url(url: &str) -> bool {
 }
 
 /// The container/codec rodio will be handed.
-fn format_of(codec: &str, container: &str, mime: &str, url: &str, label: &str) -> Option<Format> {
+pub(crate) fn format_of(codec: &str, container: &str, mime: &str, url: &str, label: &str) -> Option<Format> {
     let codec = codec.to_ascii_lowercase();
     let container = container.to_ascii_lowercase();
     let mime = mime.to_ascii_lowercase();
@@ -800,6 +809,24 @@ fn number_before(text: &str, unit: &str) -> Option<f64> {
 }
 
 // ── Matching ─────────────────────────────────────────────────────────────
+
+/// How well a catalogue row (`found_*`) is the same recording as the wanted song: `None`
+/// when it is a different song, cut or version, otherwise a score (higher is better).
+/// The same rules the addon rows are held to, for the other sources (see `sources`).
+pub(crate) fn match_score(title: &str, artist: &str, duration: Option<u32>, found_title: &str, found_artist: &str, found_duration: Option<u32>) -> Option<i32> {
+    let candidate = Candidate {
+        id: String::new(),
+        title: found_title.to_owned(),
+        artist: found_artist.to_owned(),
+        duration: found_duration,
+        quality: String::new(),
+        format: String::new(),
+        provider: String::new(),
+        atmos: false,
+        stream_url: None,
+    };
+    score(&candidate, title, artist, duration, false)
+}
 
 fn rank(mut candidates: Vec<Candidate>, title: &str, artist: &str, duration: Option<u32>, prefer_atmos: bool) -> Vec<Candidate> {
     let mut scored: Vec<(Candidate, i32)> = candidates.drain(..).filter_map(|c| score(&c, title, artist, duration, prefer_atmos).map(|s| (c, s))).collect();
@@ -1041,7 +1068,7 @@ fn addon_err(e: reqwest::Error) -> anyhow::Error {
 }
 
 /// How many bytes the stream holds, from a HEAD or a one-byte range request.
-async fn content_size(http: &reqwest::Client, url: &str) -> Option<u64> {
+pub(crate) async fn content_size(http: &reqwest::Client, url: &str) -> Option<u64> {
     if let Ok(response) = http.head(url).timeout(PROBE_TIMEOUT).header("User-Agent", agent()).send().await
         && response.status().is_success()
         && let Some(size) = response.content_length().filter(|n| *n > 0)
