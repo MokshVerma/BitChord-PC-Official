@@ -1463,6 +1463,11 @@ fn settings_playback(app: &mut App, ui: &mut Ui) {
         ui.add_space(12.0);
         hires_sources_editor(app, ui);
         ui.add_space(10.0);
+        setting_row(ui, "JioSaavn source", Some("Play a song from JioSaavn (up to 320 kbps) when it has the same recording, instead of YouTube's stream. Ranked below the hi-res addons; YouTube plays when JioSaavn doesn't have the song."), |ui| {
+            if toggle(ui, &mut app.jiosaavn, "JioSaavn source").changed() {
+                app.backend.set_jiosaavn(app.jiosaavn);
+            }
+        });
         setting_row(ui, "Prefer Dolby Atmos", Some("Ask the hi-res sources for a Dolby Atmos copy when they offer one. Falls back to the best stereo copy when the stream's codec can't be decoded."), |ui| {
             if toggle(ui, &mut app.prefer_atmos, "Prefer Dolby Atmos").changed() {
                 app.backend.set_prefer_atmos(app.prefer_atmos);

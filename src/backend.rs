@@ -15,6 +15,7 @@ use crate::art::Art;
 use crate::audio::{AudioCmd, AudioHandle};
 use crate::lyrics::{self, LyricsSet};
 use crate::model::{self, Card, Target, Thumb, Track, sized};
+use crate::sources::AnySource;
 use crate::stream::{self, Shared};
 use crate::{hires, innertube, jsc, webmusic, ytdlp, ytm, ytmapi};
 
@@ -474,6 +475,11 @@ const PREFETCH_SONG_WAIT: std::time::Duration = std::time::Duration::from_secs(2
 /// How long playback waits for the hi-res sources before falling back to YouTube. A cold
 /// addon mints a lossless URL in a few seconds, and every source is asked at once.
 const HIRES_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// With only the quick sources (JioSaavn: about half a second) switched on, YouTube's stream
+/// is held this long for them; past it YouTube plays and the upgrade carries on.
+const SOURCE_HOLD: std::time::Duration = std::time::Duration::from_millis(2500);
+/// A lower-ranked source's copy waits this long for a higher-ranked one to answer.
+const RANK_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct Backend {
@@ -499,6 +505,8 @@ pub struct Backend {
     hq: Arc<std::sync::atomic::AtomicBool>,
     /// The listener's hi-res addons, in the order their links were given.
     hires: Arc<std::sync::RwLock<Vec<Arc<hires::Client>>>>,
+    /// The other catalogues (JioSaavn), ranked below the addons.
+    sources: Arc<std::sync::RwLock<crate::sources::SourceRegistry>>,
     /// Ask the addons for Dolby Atmos renditions when they offer one.
     atmos: Arc<std::sync::atomic::AtomicBool>,
     /// Play YouTube first and upgrade to hi-res in the background.
@@ -535,7 +543,7 @@ impl Backend {
         {
             log::warn!("proxy relay: {e:#}");
         }
-        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), atmos: Default::default(), disable_direct: Default::default(), reverted: Default::default(), songs: Default::default() };
+        let backend = Self { rt: Arc::new(rt), api, tx, audio, wake, prefetched: Default::default(), current: Default::default(), data_dir, lyrics, translate, jsc, premium: Arc::new(tokio::sync::Mutex::new(Err(None))), hq: Default::default(), hires: Default::default(), sources: Default::default(), atmos: Default::default(), disable_direct: Default::default(), reverted: Default::default(), songs: Default::default() };
         backend.keep_signed_in();
         Ok(backend)
     }
@@ -1419,22 +1427,125 @@ impl Backend {
     async fn resolve(&self, video_id: &str, best: bool, track: Option<&Track>, allow_hires: bool, prefetch: bool) -> anyhow::Result<(Source, ResolvedStream)> {
         // The listener's addons answer for the songs they have; when they miss, YouTube plays.
         let reverted = self.reverted.lock().unwrap().contains(video_id);
-        let hires = if allow_hires && !reverted { self.hires.read().unwrap().clone() } else { Vec::new() };
+        let use_sources = allow_hires && !reverted;
+        let hires = if use_sources { self.hires.read().unwrap().clone() } else { Vec::new() };
+        let others = if use_sources { self.sources.read().unwrap().active().to_vec() } else { Vec::new() };
         if let Some(track) = track
-            && !hires.is_empty()
+            && (!hires.is_empty() || !others.is_empty())
         {
-            let started = std::time::Instant::now();
-            match tokio::time::timeout(HIRES_WAIT, self.from_hires(&hires, track, prefetch)).await {
-                Ok(Some(s)) => {
-                    if let Some(info) = s.info.as_ref() {
-                        log::info!("{video_id}: {} audio from {}", info.badge(), info.source);
-                    }
-                    return Ok((Source::HiRes, s));
-                }
-                Ok(None) => log::info!("{video_id}: no hi-res source has a copy ({:.1}s)", started.elapsed().as_secs_f32()),
-                Err(_) => log::info!("{video_id}: the hi-res sources gave no answer in {HIRES_WAIT:?}"),
-            }
+            return self.resolve_ranked(video_id, best, track, &hires, &others, prefetch).await;
         }
+        self.resolve_youtube(video_id, best).await
+    }
+
+    /// The ranked sources (the addons, then the other catalogues) against YouTube's own
+    /// resolve, started together. A source's copy plays as soon as it is in hand; YouTube's
+    /// stream is held for them (`HIRES_WAIT` when addons are set, `SOURCE_HOLD` for the
+    /// quick catalogues alone), released at once when none has the song, and played
+    /// regardless once the hold runs out — the upgrade then carries on in the background.
+    async fn resolve_ranked(&self, video_id: &str, best: bool, track: &Track, hires: &[Arc<hires::Client>], others: &[Arc<AnySource>], prefetch: bool) -> anyhow::Result<(Source, ResolvedStream)> {
+        let started = std::time::Instant::now();
+        let hold = if hires.is_empty() { SOURCE_HOLD } else { HIRES_WAIT };
+        let mut cat = std::pin::pin!(tokio::time::timeout(HIRES_WAIT, self.find_ranked(hires, others, track, prefetch)));
+        let mut youtube = std::pin::pin!(self.resolve_youtube(video_id, best));
+        let found = |source: Source, s: ResolvedStream| {
+            if let Some(info) = s.info.as_ref() {
+                log::info!("{video_id}: {} audio from {}", info.badge(), info.source);
+            }
+            (source, s)
+        };
+        tokio::select! {
+            c = &mut cat => match c {
+                Ok(Some((source, s))) => Ok(found(source, s)),
+                Ok(None) => {
+                    log::info!("{video_id}: no source has a copy ({:.1}s)", started.elapsed().as_secs_f32());
+                    youtube.await
+                }
+                Err(_) => {
+                    log::info!("{video_id}: the sources gave no answer in {HIRES_WAIT:?}");
+                    youtube.await
+                }
+            },
+            y = &mut youtube => match y {
+                Ok(played) => match tokio::time::timeout(hold, &mut cat).await {
+                    Ok(Ok(Some((source, s)))) => Ok(found(source, s)),
+                    _ => Ok(played),
+                },
+                // A song YouTube won't serve may be one a catalogue has.
+                Err(e) => match cat.await {
+                    Ok(Some((source, s))) => Ok(found(source, s)),
+                    _ => Err(e),
+                },
+            },
+        }
+    }
+
+    /// The other catalogues, in rank order, for the same recording as `track`.
+    async fn find_in_sources(&self, sources: &[Arc<AnySource>], track: &Track) -> Option<ResolvedStream> {
+        let http = self.http();
+        for source in sources {
+            let Some((row, found)) = source.find(&http, track).await else { continue };
+            let Some(format) = hires::format_of("aac", "mp4", "audio/mp4", &found.url, "") else { continue };
+            let size = hires::content_size(&http, &found.url).await.unwrap_or(hires::UNKNOWN_SIZE);
+            let duration_ms = row.duration.map_or(0, |s| s as u64 * 1000);
+            let info = hires::Info {
+                source: found.kind.label().to_owned(),
+                host: hires::host_of(&found.url),
+                codec: found.codec.to_owned(),
+                quality: String::new(),
+                bitrate_kbps: found.kbps,
+                sample_rate: None,
+                bit_depth: None,
+                channels: None,
+                atmos: false,
+                size,
+                duration_ms,
+            };
+            log::info!("{}: \"{}\" from {} ({})", track.id, track.title, found.kind.label(), info.badge());
+            return Some(ResolvedStream {
+                url: found.url,
+                size,
+                duration_ms,
+                user_agent: crate::sources::USER_AGENT.to_owned(),
+                loudness_db: None,
+                format,
+                info: Some(info),
+                ranging: stream::Ranging::Header,
+                data: None,
+            });
+        }
+        None
+    }
+
+    /// Every source that has a copy, ranked: the addons above the other catalogues. A
+    /// lower-ranked copy that arrives first is held `RANK_GRACE` for the higher one.
+    async fn find_ranked(&self, hires: &[Arc<hires::Client>], others: &[Arc<AnySource>], track: &Track, prefetch: bool) -> Option<(Source, ResolvedStream)> {
+        if others.is_empty() {
+            return self.from_hires(hires, track, prefetch).await.map(|s| (Source::HiRes, s));
+        }
+        if hires.is_empty() {
+            return self.find_in_sources(others, track).await.map(|s| (Source::Catalogue, s));
+        }
+        let mut high = std::pin::pin!(self.from_hires(hires, track, prefetch));
+        let mut low = std::pin::pin!(self.find_in_sources(others, track));
+        tokio::select! {
+            h = &mut high => match h {
+                Some(s) => Some((Source::HiRes, s)),
+                None => low.await.map(|s| (Source::Catalogue, s)),
+            },
+            l = &mut low => match l {
+                None => high.await.map(|s| (Source::HiRes, s)),
+                Some(l) => match tokio::time::timeout(RANK_GRACE, &mut high).await {
+                    Ok(Some(s)) => Some((Source::HiRes, s)),
+                    _ => Some((Source::Catalogue, l)),
+                },
+            },
+        }
+    }
+
+    /// YouTube's own streams: the high-quality Premium one, the anonymous one, and the
+    /// signed-in players for what needs an account.
+    async fn resolve_youtube(&self, video_id: &str, best: bool) -> anyhow::Result<(Source, ResolvedStream)> {
         let hq = best || self.hq.load(Ordering::Relaxed);
         if best
             && !self.jsc.ready()
@@ -1515,6 +1626,12 @@ impl Backend {
                 let sources = self.hires.read().unwrap().clone();
                 anyhow::ensure!(!sources.is_empty(), "no hi-res source is set");
                 self.from_hires(&sources, track, false).await.ok_or_else(|| anyhow::anyhow!("no hi-res source has a copy"))?
+            }
+            Source::Catalogue => {
+                let track = track.ok_or_else(|| anyhow::anyhow!("no song to look up"))?;
+                let sources = self.sources.read().unwrap().active().to_vec();
+                anyhow::ensure!(!sources.is_empty(), "no source is set");
+                self.find_in_sources(&sources, track).await.ok_or_else(|| anyhow::anyhow!("no source has a copy"))?
             }
         })
     }
@@ -1648,7 +1765,8 @@ impl Backend {
             return;
         }
         let hires = self.hires.read().unwrap().clone();
-        if hires.is_empty() {
+        let others = self.sources.read().unwrap().active().to_vec();
+        if hires.is_empty() && others.is_empty() {
             return;
         }
 
@@ -1667,14 +1785,14 @@ impl Backend {
         let _guard = UpgradeGuard { backend: self, generation };
 
         let started = std::time::Instant::now();
-        let stream_res = match tokio::time::timeout(HIRES_WAIT, self.from_hires(&hires, &track, false)).await {
-            Ok(Some(s)) => s,
+        let (source, stream_res) = match tokio::time::timeout(HIRES_WAIT, self.find_ranked(&hires, &others, &track, false)).await {
+            Ok(Some(found)) => found,
             Ok(None) => {
-                log::info!("{video_id}: no hi-res source has a copy ({:.1}s)", started.elapsed().as_secs_f32());
+                log::info!("{video_id}: no source has a copy ({:.1}s)", started.elapsed().as_secs_f32());
                 return;
             }
             Err(_) => {
-                log::info!("{video_id}: the hi-res sources gave no answer in {HIRES_WAIT:?}");
+                log::info!("{video_id}: the sources gave no answer in {HIRES_WAIT:?}");
                 return;
             }
         };
@@ -1692,7 +1810,7 @@ impl Backend {
             log::info!("{video_id}: upgrading to {} audio from {}", info.badge(), info.source);
         }
 
-        let (source, s) = (Source::HiRes, stream_res);
+        let s = stream_res;
         let shared = if let Some(data) = s.data {
             Shared::from_bytes_with_format(data, s.duration_ms, s.loudness_db, s.format.clone(), s.info.clone())
         } else {
@@ -1776,6 +1894,13 @@ impl Backend {
         self.rt.spawn(async move {
             this.try_upgrade_hires(video_id, generation, track).await;
         });
+    }
+
+    /// Switch JioSaavn on or off as a source, ranked below the hi-res addons.
+    pub fn set_jiosaavn(&self, on: bool) {
+        let sources = if on { vec![AnySource::JioSaavn(crate::sources::jiosaavn::JioSaavn)] } else { Vec::new() };
+        *self.sources.write().unwrap() = crate::sources::SourceRegistry::new(sources);
+        log::info!("JioSaavn source: {}", if on { "on" } else { "off" });
     }
 
     /// Point the hi-res sources at the links in `links`, one per line (empty: none). The
@@ -1863,6 +1988,8 @@ enum Source {
     YtDlp,
     /// The listener's own addon server (see `hires`).
     HiRes,
+    /// One of the other catalogues (see `sources`).
+    Catalogue,
 }
 
 struct ResolvedStream {

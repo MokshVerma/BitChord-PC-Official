@@ -813,7 +813,7 @@ fn options_menu(app: &mut App, ui: &mut Ui, rect: Rect, track: &crate::model::Tr
         }
         // Quality toggle at the bottom: revert when hi-res is playing, upgrade when not.
         let hires_playing = app.audio_info.as_ref().is_some_and(|(_, i)| i.lossless() || i.atmos);
-        if hires_playing || !app.hires_sources.is_empty() {
+        if hires_playing || !app.hires_sources.is_empty() || app.jiosaavn {
             menu_divider(ui);
             if hires_playing {
                 if widgets::menu_action(ui, Some(icon::MUSIC), "Revert quality") {

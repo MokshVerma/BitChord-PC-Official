@@ -415,6 +415,8 @@ pub struct App {
     hires_checking: std::collections::HashSet<String>,
     /// Ask the addons for Dolby Atmos renditions.
     prefer_atmos: bool,
+    /// JioSaavn is a source (ranked below the addons).
+    jiosaavn: bool,
     /// What the playing stream is (codec, rate, depth, size), when a hi-res source
     /// supplied it, with the generation it belongs to.
     audio_info: Option<(u64, crate::hires::Info)>,
@@ -616,6 +618,8 @@ impl App {
         backend.set_hires_source(&hires_sources.join("\n"));
         let prefer_atmos = get("prefer_atmos").is_some_and(|v| v == "1");
         backend.set_prefer_atmos(prefer_atmos);
+        let jiosaavn = get("jiosaavn").is_some_and(|v| v == "1");
+        backend.set_jiosaavn(jiosaavn);
         let show_nerd_stats = get("show_nerd_stats").is_some_and(|v| v == "1");
         let disable_direct_stream = get("disable_direct_stream").is_some_and(|v| v == "1");
         backend.set_disable_direct_stream(disable_direct_stream);
@@ -768,6 +772,7 @@ impl App {
             hires_checks: Default::default(),
             hires_checking: Default::default(),
             prefer_atmos,
+            jiosaavn,
             audio_info: None,
             show_nerd_stats,
             stream_stats: None,
@@ -1563,6 +1568,7 @@ impl eframe::App for App {
         storage.set_string("signature_api", self.signature_api.clone());
         storage.set_string("hires_source", self.hires_sources.join("\n"));
         storage.set_string("prefer_atmos", b(self.prefer_atmos));
+        storage.set_string("jiosaavn", b(self.jiosaavn));
         storage.set_string("show_nerd_stats", b(self.show_nerd_stats));
         storage.set_string("disable_direct_stream", b(self.disable_direct_stream));
         storage.set_string("sponsorblock", b(self.sponsorblock));
